@@ -27,7 +27,7 @@ class TelegramGroupManager:
         self.api_id = api_id
         self.api_hash = api_hash
         self.phone_number = phone_number
-        self.client = TelegramClient("session", api_id, api_hash)
+        self.client = TelegramClient("telegram", api_id, api_hash)
 
     async def connect(self):
         """Connect to Telegram and authenticate"""
