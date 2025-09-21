@@ -40,14 +40,66 @@ class TelegramGroupManager:
 
         logger.info("Successfully connected to Telegram")
 
-    async def get_group_entity(self, group_identifier):
-        """Get group entity by username, invite link, or group ID"""
-        try:
-            entity = await self.client.get_entity(group_identifier)
-            return entity
-        except Exception as e:
-            logger.error(f"Error getting group entity: {e}")
+    async def get_user_groups(self):
+        """Fetch all groups and channels the user is part of"""
+        groups = []
+
+        logger.info("Fetching your groups and channels...")
+        async for dialog in self.client.iter_dialogs():
+            if dialog.is_group or dialog.is_channel:
+                group_info = {
+                    "id": dialog.id,
+                    "title": dialog.name,
+                    "username": getattr(dialog.entity, "username", None),
+                    "entity": dialog.entity,
+                    "type": "Channel" if dialog.is_channel else "Group",
+                    "participants_count": getattr(
+                        dialog.entity, "participants_count", "N/A"
+                    ),
+                }
+                groups.append(group_info)
+
+        return groups
+
+    async def prompt_group_selection(self):
+        """Display all groups and let user select one"""
+        groups = await self.get_user_groups()
+
+        if not groups:
+            logger.error("No groups or channels found in your account")
             return None
+
+        print("\n" + "=" * 60)
+        print("YOUR GROUPS AND CHANNELS:")
+        print("=" * 60)
+
+        for i, group in enumerate(groups, 1):
+            username_display = f" (@{group['username']})" if group["username"] else ""
+            print(f"{i:2d}. {group['title']}{username_display}")
+            print(f"    Type: {group['type']}, Members: {group['participants_count']}")
+            print()
+
+        print("=" * 60)
+
+        while True:
+            try:
+                choice = input(
+                    f"Select a group (1-{len(groups)}), or 'q' to quit: "
+                ).strip()
+
+                if choice.lower() == "q":
+                    return None
+
+                choice_num = int(choice)
+                if 1 <= choice_num <= len(groups):
+                    selected_group = groups[choice_num - 1]
+                    print(f"\nSelected: {selected_group['title']}")
+                    return selected_group["entity"]
+                else:
+                    print(f"Please enter a number between 1 and {len(groups)}")
+
+            except ValueError:
+                print("Please enter a valid number or 'q' to quit")
 
     async def add_members_to_group(self, group_entity, phone_numbers, delay=5):
         """
@@ -58,7 +110,6 @@ class TelegramGroupManager:
             phone_numbers: List of phone numbers (with country code)
             delay: Delay between requests in seconds
         """
-        # FIX 1: Handle case where group_entity is None
         if group_entity is None:
             logger.error("Group entity is None, cannot add members")
             return [], [
@@ -92,7 +143,6 @@ class TelegramGroupManager:
                     continue
 
                 # Add user to group based on group type
-                # Use utils.get_input_* functions to convert entities to proper Input types
                 if isinstance(group_entity, Channel):
                     # For channels/supergroups
                     input_channel = utils.get_input_channel(group_entity)
@@ -237,75 +287,8 @@ def read_phone_numbers_from_directory(directory_path="phone-numbers"):
     return phone_numbers
 
 
-# Example usage
-async def main():
-    # Get API credentials from environment variables
-    API_ID = os.getenv("TELEGRAM_API_ID")
-    API_HASH = os.getenv("TELEGRAM_API_HASH")
-    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE_NUMBER")
-
-    # Validate that environment variables are set
-    if not all([API_ID, API_HASH, PHONE_NUMBER]):
-        logger.error(
-            "Please set TELEGRAM_API_ID, TELEGRAM_API_HASH, and TELEGRAM_PHONE_NUMBER in your .env file"
-        )
-        return
-
-    # Group identifier (username, invite link, or group ID)
-    GROUP_IDENTIFIER = os.getenv("TELEGRAM_GROUP_IDENTIFIER", "@your_group_username")
-
-    # Read phone numbers from the phone-numbers directory
-    PHONE_NUMBERS = read_phone_numbers_from_directory()
-
-    if not PHONE_NUMBERS:
-        logger.error("No phone numbers found to process")
-        return
-
-    # Initialize the manager
-    manager = TelegramGroupManager(API_ID, API_HASH, PHONE_NUMBER)
-
-    try:
-        # Connect to Telegram
-        await manager.connect()
-
-        # Get the group entity
-        group = await manager.get_group_entity(GROUP_IDENTIFIER)
-        if not group:
-            logger.error("Could not find the group")
-            return
-
-        # Get group title safely
-        group_title = getattr(
-            group, "title", getattr(group, "username", "Unknown Group")
-        )
-        logger.info(f"Found group: {group_title}")
-
-        # Add members to the group
-        successful, failed = await manager.add_members_to_group(
-            group, PHONE_NUMBERS, delay=3  # 3 seconds delay between requests
-        )
-
-        # Print results
-        logger.info(f"\n=== RESULTS ===")
-        logger.info(f"Successfully added: {len(successful)} members")
-        for phone in successful:
-            logger.info(f"  ✓ {phone}")
-
-        logger.info(f"\nFailed to add: {len(failed)} members")
-        for item in failed:
-            logger.info(f"  ✗ {item['phone']}: {item['error']}")
-
-    except Exception as e:
-        logger.error(f"Main execution error: {e}")
-
-    finally:
-        # Disconnect from Telegram
-        await manager.disconnect()
-
-
-# Advanced batch processing with chunks
-async def batch_add_with_chunks():
-    """Add members in smaller chunks to avoid rate limiting"""
+async def batch_add_members():
+    """Add members in chunks to avoid rate limiting (Batch Processing Mode)"""
 
     # Get API credentials from environment variables
     API_ID = os.getenv("TELEGRAM_API_ID")
@@ -318,8 +301,6 @@ async def batch_add_with_chunks():
             "Please set TELEGRAM_API_ID, TELEGRAM_API_HASH, and TELEGRAM_PHONE_NUMBER in your .env file"
         )
         return
-
-    GROUP_IDENTIFIER = os.getenv("TELEGRAM_GROUP_IDENTIFIER", "@your_group_username")
 
     # Read phone numbers from the phone_numbers directory
     PHONE_NUMBERS = read_phone_numbers_from_directory()
@@ -328,21 +309,49 @@ async def batch_add_with_chunks():
         logger.error("No phone numbers found to process")
         return
 
-    CHUNK_SIZE = int(
-        os.getenv("TELEGRAM_CHUNK_SIZE", 10)
-    )  # Process 10 numbers at a time by default
-    CHUNK_DELAY = int(
-        os.getenv("TELEGRAM_CHUNK_DELAY", 60)
-    )  # Wait 60 seconds between chunks by default
+    # Get batch processing settings from environment variables
+    CHUNK_SIZE = int(os.getenv("TELEGRAM_CHUNK_SIZE", 10))
+    CHUNK_DELAY = int(os.getenv("TELEGRAM_CHUNK_DELAY", 60))
+    REQUEST_DELAY = int(os.getenv("TELEGRAM_REQUEST_DELAY", 3))
 
     manager = TelegramGroupManager(API_ID, API_HASH, PHONE_NUMBER)
 
     try:
+        # Connect to Telegram
         await manager.connect()
-        group = await manager.get_group_entity(GROUP_IDENTIFIER)
 
+        # Let user select a group from their list
+        group = await manager.prompt_group_selection()
         if not group:
-            logger.error("Could not find the group")
+            logger.info("No group selected. Exiting.")
+            return
+
+        group_title = getattr(
+            group, "title", getattr(group, "username", "Unknown Group")
+        )
+        logger.info(f"Selected group: {group_title}")
+
+        # Show batch configuration
+        print(f"\n{'='*50}")
+        print("BATCH PROCESSING CONFIGURATION:")
+        print(f"{'='*50}")
+        print(f"Total phone numbers: {len(PHONE_NUMBERS)}")
+        print(f"Chunk size: {CHUNK_SIZE}")
+        print(f"Delay between requests: {REQUEST_DELAY} seconds")
+        print(f"Delay between chunks: {CHUNK_DELAY} seconds")
+        print(
+            f"Estimated chunks: {(len(PHONE_NUMBERS) + CHUNK_SIZE - 1) // CHUNK_SIZE}"
+        )
+        print(f"{'='*50}")
+
+        # Confirm with user
+        confirm = (
+            input(f"\nStart batch processing for '{group_title}'? (y/n): ")
+            .strip()
+            .lower()
+        )
+        if confirm != "y":
+            logger.info("Operation cancelled.")
             return
 
         # Process in chunks
@@ -355,9 +364,10 @@ async def batch_add_with_chunks():
             total_chunks = (len(PHONE_NUMBERS) + CHUNK_SIZE - 1) // CHUNK_SIZE
 
             logger.info(f"\n=== Processing Chunk {chunk_num}/{total_chunks} ===")
+            logger.info(f"Chunk size: {len(chunk)} phone numbers")
 
             successful, failed = await manager.add_members_to_group(
-                group, chunk, delay=2
+                group, chunk, delay=REQUEST_DELAY
             )
 
             all_successful.extend(successful)
@@ -372,9 +382,22 @@ async def batch_add_with_chunks():
                 logger.info(f"Waiting {CHUNK_DELAY} seconds before next chunk...")
                 await asyncio.sleep(CHUNK_DELAY)
 
-        logger.info(f"\n=== FINAL RESULTS ===")
+        # Print final results
+        logger.info(f"\n{'='*50}")
+        logger.info("BATCH PROCESSING COMPLETED")
+        logger.info(f"{'='*50}")
         logger.info(f"Total successful: {len(all_successful)}")
         logger.info(f"Total failed: {len(all_failed)}")
+
+        if all_successful:
+            logger.info(f"\nSuccessfully added members:")
+            for phone in all_successful:
+                logger.info(f"  ✓ {phone}")
+
+        if all_failed:
+            logger.info(f"\nFailed to add members:")
+            for item in all_failed:
+                logger.info(f"  ✗ {item['phone']}: {item['error']}")
 
     except Exception as e:
         logger.error(f"Batch processing error: {e}")
@@ -384,7 +407,6 @@ async def batch_add_with_chunks():
 
 
 if __name__ == "__main__":
-    # Choose which function to run
-    asyncio.run(main())
-    # OR for batch processing:
-    # asyncio.run(batch_add_with_chunks())
+    print("Telegram Group Member Adder - Batch Processing Mode")
+    print("=" * 50)
+    asyncio.run(batch_add_members())
