@@ -2,3 +2,5 @@ venv
 .env
 phone-numbers
 notes
+
+session.session
