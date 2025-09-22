@@ -3,22 +3,24 @@ import os
 from telethon.sync import TelegramClient
 from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.tl.functions.messages import AddChatUserRequest
-from telethon.tl.types import (
-    User,
-    Channel,
-    Chat,
+from telethon.tl.functions.contacts import GetContactsRequest
+from telethon.tl.types import User, Channel, Chat
+from telethon.errors import (
+    FloodWaitError,
+    UserPrivacyRestrictedError,
+    PeerFloodError,
+    UserAlreadyParticipantError,
+    ChatAdminRequiredError,
 )
-from telethon.errors import FloodWaitError, UserPrivacyRestrictedError, PeerFloodError
-from telethon.errors import UserAlreadyParticipantError, ChatAdminRequiredError
 from telethon import utils
 import logging
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -30,21 +32,19 @@ class TelegramGroupManager:
         self.client = TelegramClient("telegram", api_id, api_hash)
 
     async def connect(self):
-        """Connect to Telegram and authenticate"""
+        """Connect to Telegram"""
         await self.client.connect()
-
         if not await self.client.is_user_authorized():
             await self.client.send_code_request(self.phone_number)
-            code = input("Enter the code you received: ")
+            code = input("📨 Enter the code sent to you in Telegram: ")
             await self.client.sign_in(self.phone_number, code)
-
-        logger.info("Successfully connected to Telegram")
+        logger.info("✅ Successfully connected to Telegram")
 
     async def get_user_groups(self):
-        """Fetch all groups and channels the user is part of"""
+        """Fetch all groups and channels, filtering out duplicates"""
         groups = []
+        groups_map = {}  # Track groups by title to filter duplicates
 
-        logger.info("Fetching your groups and channels...")
         async for dialog in self.client.iter_dialogs():
             if dialog.is_group or dialog.is_channel:
                 group_info = {
@@ -52,361 +52,271 @@ class TelegramGroupManager:
                     "title": dialog.name,
                     "username": getattr(dialog.entity, "username", None),
                     "entity": dialog.entity,
-                    "type": "Channel" if dialog.is_channel else "Group",
+                    "type": "📢 Channel" if dialog.is_channel else "👥 Group",
                     "participants_count": getattr(
                         dialog.entity, "participants_count", "N/A"
                     ),
                 }
-                groups.append(group_info)
+
+                # Use title as key to identify potential duplicates
+                title_key = group_info["title"].lower().strip()
+
+                # If we already have a group with this title
+                if title_key in groups_map:
+                    existing_group = groups_map[title_key]
+
+                    # Prefer the group with a username over the one without
+                    if group_info["username"] and not existing_group["username"]:
+                        # Replace the existing group (without username) with this one (with username)
+                        # Remove the existing group from the list
+                        groups = [
+                            g for g in groups if g["title"].lower().strip() != title_key
+                        ]
+                        groups_map[title_key] = group_info
+                        groups.append(group_info)
+                    elif not group_info["username"] and existing_group["username"]:
+                        # Keep the existing group (with username), skip this one (without username)
+                        pass
+                    else:
+                        # Both have usernames or both don't, keep the first one
+                        if group_info not in groups:
+                            groups.append(group_info)
+                else:
+                    # First time seeing this group title
+                    groups_map[title_key] = group_info
+                    groups.append(group_info)
 
         return groups
 
     async def prompt_group_selection(self):
-        """Display all groups and let user select one"""
+        """Show groups and let user pick one"""
         groups = await self.get_user_groups()
-
         if not groups:
-            logger.error("No groups or channels found in your account")
+            logger.error("⚠️ No groups or channels found")
             return None
 
-        print("\n" + "=" * 60)
-        print("YOUR GROUPS AND CHANNELS:")
-        print("=" * 60)
-
+        print("\n" + "═" * 60)
+        print("📂 YOUR GROUPS AND CHANNELS")
+        print("═" * 60)
         for i, group in enumerate(groups, 1):
             username_display = f" (@{group['username']})" if group["username"] else ""
             print(f"{i:2d}. {group['title']}{username_display}")
-            print(f"    Type: {group['type']}, Members: {group['participants_count']}")
+            print(f"    {group['type']} | 👤 Members: {group['participants_count']}")
             print()
 
-        print("=" * 60)
-
         while True:
+            choice = input(
+                f"👉 Select a group (1-{len(groups)}), or 'q' to quit: "
+            ).strip()
+            if choice.lower() == "q":
+                return None
             try:
-                choice = input(
-                    f"Select a group (1-{len(groups)}), or 'q' to quit: "
-                ).strip()
-
-                if choice.lower() == "q":
-                    return None
-
                 choice_num = int(choice)
                 if 1 <= choice_num <= len(groups):
-                    selected_group = groups[choice_num - 1]
-                    print(f"\nSelected: {selected_group['title']}")
-                    return selected_group["entity"]
-                else:
-                    print(f"Please enter a number between 1 and {len(groups)}")
-
+                    selected = groups[choice_num - 1]
+                    print(f"\n🎯 Selected: {selected['title']}")
+                    return selected["entity"]
             except ValueError:
-                print("Please enter a valid number or 'q' to quit")
+                pass
+            print("❌ Invalid input, try again.")
+
+    async def get_contacts_with_prefix(self, prefix, group_entity):
+        """Fetch contacts and filter by prefix, excluding existing group members"""
+        result = await self.client(GetContactsRequest(hash=0))
+        users = result.users  # type: ignore
+
+        # Fetch existing group participants
+        existing = await self.client.get_participants(group_entity)
+        existing_phones = {
+            (
+                "+" + p.phone
+                if p.phone and not p.phone.startswith("+")
+                else (p.phone or "")
+            )
+            for p in existing
+        }
+
+        filtered = []
+        for c in users:
+            if not isinstance(c, User):
+                continue
+            name = (c.first_name or "") + " " + (c.last_name or "")
+            phone = c.phone or ""
+            phone_fmt = "+" + phone if phone and not phone.startswith("+") else phone
+
+            if (
+                (name.lower().startswith(prefix.lower()) or phone.startswith(prefix))
+                and phone_fmt
+                and phone_fmt not in existing_phones
+            ):
+                filtered.append(phone_fmt)
+
+        return filtered
 
     async def add_members_to_group(self, group_entity, phone_numbers, delay=5):
-        """
-        Add multiple phone numbers to a group with error handling and delays
-
-        Args:
-            group_entity: The group entity object
-            phone_numbers: List of phone numbers (with country code)
-            delay: Delay between requests in seconds
-        """
-        if group_entity is None:
-            logger.error("Group entity is None, cannot add members")
-            return [], [
-                {"phone": phone, "error": "Group not found"} for phone in phone_numbers
-            ]
-
-        successful_adds = []
-        failed_adds = []
-
+        """Add members to group"""
+        successful, failed = [], []
         for i, phone_number in enumerate(phone_numbers):
             try:
-                logger.info(f"Processing {i+1}/{len(phone_numbers)}: {phone_number}")
-
-                # Get user entity from phone number
+                logger.info(f"➡️  Processing {i+1}/{len(phone_numbers)}: {phone_number}")
                 try:
                     user_entity = await self.client.get_entity(phone_number)
-
-                    # Ensure we have a User entity, not Channel or Chat
                     if not isinstance(user_entity, User):
-                        logger.error(f"Entity for {phone_number} is not a user")
-                        failed_adds.append(
-                            {"phone": phone_number, "error": "Entity is not a user"}
-                        )
-                        continue
-
+                        raise ValueError("Entity is not a user")
                 except Exception as e:
-                    logger.error(f"Could not find user with phone {phone_number}: {e}")
-                    failed_adds.append(
-                        {"phone": phone_number, "error": f"User not found: {e}"}
-                    )
+                    logger.error(f"❌ Could not resolve {phone_number}: {e}")
+                    failed.append({"phone": phone_number, "error": str(e)})
                     continue
 
-                # Add user to group based on group type
                 if isinstance(group_entity, Channel):
-                    # For channels/supergroups
                     input_channel = utils.get_input_channel(group_entity)
-                    if not input_channel:
-                        logger.error(
-                            f"Failed to get valid input channel for group: {getattr(group_entity, 'title', 'Unknown')}"
-                        )
-                        failed_adds.append(
-                            {
-                                "phone": phone_number,
-                                "error": "Invalid channel reference - cannot add members",
-                            }
-                        )
-                        continue
 
-                    input_user = utils.get_input_user(user_entity)
-                    if not input_user:
-                        logger.error(
-                            f"Failed to get valid input user for phone: {phone_number}"
-                        )
-                        failed_adds.append(
-                            {
-                                "phone": phone_number,
-                                "error": "Invalid user reference - cannot add to channel",
-                            }
-                        )
-                        continue
+                    if not input_channel:
+                        logger.error(f"❌ Invalid input channel")
+                        return
 
                     await self.client(
                         InviteToChannelRequest(
-                            channel=input_channel, users=[input_user]
+                            channel=input_channel,
+                            users=[utils.get_input_user(user_entity)],
                         )
                     )
                 elif isinstance(group_entity, Chat):
-                    # For regular groups
-                    input_user = utils.get_input_user(user_entity)
-
                     await self.client(
                         AddChatUserRequest(
-                            chat_id=group_entity.id, user_id=input_user, fwd_limit=50
+                            chat_id=group_entity.id,
+                            user_id=utils.get_input_user(user_entity),
+                            fwd_limit=50,
                         )
                     )
                 else:
-                    logger.error(f"Unsupported group type: {type(group_entity)}")
-                    failed_adds.append(
-                        {"phone": phone_number, "error": "Unsupported group type"}
-                    )
-                    continue
+                    raise ValueError("Unsupported group type")
 
-                successful_adds.append(phone_number)
-                logger.info(f"Successfully added {phone_number}")
-
-                # Add delay to avoid rate limiting
+                successful.append(phone_number)
+                logger.info(f"✅ Added {phone_number}")
                 await asyncio.sleep(delay)
 
-            except FloodWaitError as e:
-                wait_time = e.seconds
-                logger.warning(f"Rate limited. Waiting {wait_time} seconds...")
-                await asyncio.sleep(wait_time)
-                # Retry the same number
-                phone_numbers.insert(i, phone_number)
-
             except UserAlreadyParticipantError:
-                logger.info(f"{phone_number} is already in the group")
-                successful_adds.append(phone_number)
-
+                logger.info(f"ℹ️ {phone_number} is already a member")
+                successful.append(phone_number)
             except UserPrivacyRestrictedError:
-                logger.warning(f"{phone_number} has privacy restrictions")
-                failed_adds.append(
-                    {"phone": phone_number, "error": "Privacy restrictions"}
-                )
-
-            except PeerFloodError:
-                logger.error(
-                    "Peer flood error. Too many requests. Wait before continuing."
-                )
-                failed_adds.append(
-                    {"phone": phone_number, "error": "Peer flood - too many requests"}
-                )
+                failed.append({"phone": phone_number, "error": "Privacy restricted"})
+            except FloodWaitError as e:
+                logger.warning(f"⏳ Flood wait {e.seconds}s, retrying...")
+                await asyncio.sleep(e.seconds)
+                phone_numbers.insert(i, phone_number)
+            except (PeerFloodError, ChatAdminRequiredError) as e:
+                failed.append({"phone": phone_number, "error": str(e)})
                 break
-
-            except ChatAdminRequiredError:
-                logger.error("Admin rights required to add members")
-                failed_adds.append(
-                    {"phone": phone_number, "error": "Admin rights required"}
-                )
-                break
-
             except Exception as e:
-                logger.error(f"Unexpected error adding {phone_number}: {e}")
-                failed_adds.append({"phone": phone_number, "error": str(e)})
+                failed.append({"phone": phone_number, "error": str(e)})
 
-        return successful_adds, failed_adds
+        return successful, failed
 
     async def disconnect(self):
-        """Disconnect from Telegram"""
         if self.client.is_connected():
             self.client.disconnect()
 
 
-def read_phone_numbers_from_directory(directory_path="phone-numbers"):
-    """
-    Read phone numbers from all text files in the specified directory.
-    Each file should contain phone numbers, one per line.
-
-    Args:
-        directory_path: Path to the directory containing phone number files
-
-    Returns:
-        List of phone numbers from all files
-    """
-    phone_numbers = []
-
-    # Check if directory exists
-    if not os.path.exists(directory_path):
-        logger.error(f"Directory '{directory_path}' does not exist")
-        return phone_numbers
-
-    # Get all text files in the directory
-    text_files = [f for f in os.listdir(directory_path) if f.endswith(".txt")]
-
-    if not text_files:
-        logger.error(f"No text files found in '{directory_path}'")
-        return phone_numbers
-
-    # Read phone numbers from each file
-    for file_name in text_files:
-        file_path = os.path.join(directory_path, file_name)
-        try:
-            with open(file_path, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith(
-                        "#"
-                    ):  # Skip empty lines and comments
-                        phone_numbers.append(line)
-            logger.info(f"Read phone numbers from {file_name}")
-        except Exception as e:
-            logger.error(f"Error reading file {file_name}: {e}")
-
-    logger.info(f"Total phone numbers loaded: {len(phone_numbers)}")
-    return phone_numbers
-
-
 async def batch_add_members():
-    """Add members in chunks to avoid rate limiting (Batch Processing Mode)"""
-
-    # Get API credentials from environment variables
+    """Batch add members"""
     API_ID = os.getenv("TELEGRAM_API_ID")
     API_HASH = os.getenv("TELEGRAM_API_HASH")
     PHONE_NUMBER = os.getenv("TELEGRAM_PHONE_NUMBER")
-
-    # Validate that environment variables are set
     if not all([API_ID, API_HASH, PHONE_NUMBER]):
-        logger.error(
-            "Please set TELEGRAM_API_ID, TELEGRAM_API_HASH, and TELEGRAM_PHONE_NUMBER in your .env file"
-        )
+        logger.error("⚠️ Set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE_NUMBER")
         return
-
-    # Read phone numbers from the phone_numbers directory
-    PHONE_NUMBERS = read_phone_numbers_from_directory()
-
-    if not PHONE_NUMBERS:
-        logger.error("No phone numbers found to process")
-        return
-
-    # Get batch processing settings from environment variables
-    CHUNK_SIZE = int(os.getenv("TELEGRAM_CHUNK_SIZE", 10))
-    CHUNK_DELAY = int(os.getenv("TELEGRAM_CHUNK_DELAY", 60))
-    REQUEST_DELAY = int(os.getenv("TELEGRAM_REQUEST_DELAY", 3))
 
     manager = TelegramGroupManager(API_ID, API_HASH, PHONE_NUMBER)
 
     try:
-        # Connect to Telegram
         await manager.connect()
-
-        # Let user select a group from their list
         group = await manager.prompt_group_selection()
         if not group:
-            logger.info("No group selected. Exiting.")
             return
 
-        group_title = getattr(
-            group, "title", getattr(group, "username", "Unknown Group")
-        )
-        logger.info(f"Selected group: {group_title}")
+        prefix = input("🔍 Enter prefix to filter contacts (e.g. +2547, SW): ").strip()
+        contacts = await manager.get_contacts_with_prefix(prefix, group)
 
-        # Show batch configuration
-        print(f"\n{'='*50}")
-        print("BATCH PROCESSING CONFIGURATION:")
-        print(f"{'='*50}")
-        print(f"Total phone numbers: {len(PHONE_NUMBERS)}")
-        print(f"Chunk size: {CHUNK_SIZE}")
-        print(f"Delay between requests: {REQUEST_DELAY} seconds")
-        print(f"Delay between chunks: {CHUNK_DELAY} seconds")
+        if not contacts:
+            logger.warning("⚠️ No contacts matched the prefix")
+            return
+
         print(
-            f"Estimated chunks: {(len(PHONE_NUMBERS) + CHUNK_SIZE - 1) // CHUNK_SIZE}"
+            f"\n✨ Found {len(contacts)} matching contacts (excluding existing members)."
         )
-        print(f"{'='*50}")
 
-        # Confirm with user
+        # Ask for start index
+        max_index = len(contacts) - 1
+        while True:
+            try:
+                start_index = int(input(f"📍 Enter start index (0 - {max_index}): "))
+                if 0 <= start_index <= max_index:
+                    break
+            except ValueError:
+                pass
+            print("❌ Invalid input, try again.")
+
+        # Ask for amount
+        max_amount = len(contacts) - start_index
+        while True:
+            try:
+                amount = int(
+                    input(
+                        f"🔢 Enter how many contacts to process (max: {max_amount}): "
+                    )
+                )
+                if 1 <= amount <= max_amount:
+                    break
+            except ValueError:
+                pass
+            print("❌ Invalid input, try again.")
+
+        # Slice contacts
+        contacts = contacts[start_index : start_index + amount]
+
         confirm = (
-            input(f"\nStart batch processing for '{group_title}'? (y/n): ")
+            input(f"⚡ Proceed with adding {len(contacts)} contacts? (y/n): ")
             .strip()
             .lower()
         )
         if confirm != "y":
-            logger.info("Operation cancelled.")
             return
 
-        # Process in chunks
-        all_successful = []
-        all_failed = []
+        CHUNK_SIZE = int(os.getenv("TELEGRAM_CHUNK_SIZE", 10))
+        CHUNK_DELAY = int(os.getenv("TELEGRAM_CHUNK_DELAY", 60))
+        REQUEST_DELAY = int(os.getenv("TELEGRAM_REQUEST_DELAY", 3))
 
-        for i in range(0, len(PHONE_NUMBERS), CHUNK_SIZE):
-            chunk = PHONE_NUMBERS[i : i + CHUNK_SIZE]
-            chunk_num = (i // CHUNK_SIZE) + 1
-            total_chunks = (len(PHONE_NUMBERS) + CHUNK_SIZE - 1) // CHUNK_SIZE
-
-            logger.info(f"\n=== Processing Chunk {chunk_num}/{total_chunks} ===")
-            logger.info(f"Chunk size: {len(chunk)} phone numbers")
-
-            successful, failed = await manager.add_members_to_group(
+        all_successful, all_failed = [], []
+        for i in range(0, len(contacts), CHUNK_SIZE):
+            chunk = contacts[i : i + CHUNK_SIZE]
+            success, fail = await manager.add_members_to_group(
                 group, chunk, delay=REQUEST_DELAY
             )
-
-            all_successful.extend(successful)
-            all_failed.extend(failed)
-
-            logger.info(
-                f"Chunk {chunk_num} completed: {len(successful)} successful, {len(failed)} failed"
-            )
-
-            # Wait between chunks (except for the last chunk)
-            if i + CHUNK_SIZE < len(PHONE_NUMBERS):
-                logger.info(f"Waiting {CHUNK_DELAY} seconds before next chunk...")
+            all_successful.extend(success)
+            all_failed.extend(fail)
+            if i + CHUNK_SIZE < len(contacts):
                 await asyncio.sleep(CHUNK_DELAY)
 
-        # Print final results
-        logger.info(f"\n{'='*50}")
-        logger.info("BATCH PROCESSING COMPLETED")
-        logger.info(f"{'='*50}")
-        logger.info(f"Total successful: {len(all_successful)}")
-        logger.info(f"Total failed: {len(all_failed)}")
+        print("\n" + "═" * 60)
+        print("🎉 BATCH PROCESS COMPLETED 🎉")
+        print(f"✅ Added: {len(all_successful)} | ❌ Failed: {len(all_failed)}")
+        print("═" * 60 + "\n")
 
-        if all_successful:
-            logger.info(f"\nSuccessfully added members:")
-            for phone in all_successful:
-                logger.info(f"  ✓ {phone}")
-
-        if all_failed:
-            logger.info(f"\nFailed to add members:")
-            for item in all_failed:
-                logger.info(f"  ✗ {item['phone']}: {item['error']}")
-
-    except Exception as e:
-        logger.error(f"Batch processing error: {e}")
+        # 🚀 Branding footer
+        print("💡 Made by Karume-lab")
+        print("🌍 Portfolio: https://karume.vercel.app")
+        print("🐙 GitHub:   https://github.com/Karume-lab")
+        print("✉️  Email:   mailto:danielkarume.work@gmail.com\n")
+        print(
+            "👉 Reach out for collaborations, freelance projects, or tech discussions!\n"
+        )
 
     finally:
         await manager.disconnect()
 
 
 if __name__ == "__main__":
-    print("Telegram Group Member Adder - Batch Processing Mode")
+    print("🚀 Telegram Group Member Adder")
     print("=" * 50)
     asyncio.run(batch_add_members())
