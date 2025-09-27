@@ -15,6 +15,8 @@ from telethon.errors import (
 from telethon import utils
 import logging
 from dotenv import load_dotenv
+from datetime import datetime
+import json
 
 # Load environment variables
 load_dotenv()
@@ -30,6 +32,32 @@ class TelegramGroupManager:
         self.api_hash = api_hash
         self.phone_number = phone_number
         self.client = TelegramClient("telegram", api_id, api_hash)
+        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.logs_dir = "logs"
+
+        # Create logs directory if it doesn't exist
+        os.makedirs(self.logs_dir, exist_ok=True)
+
+    def log_failed_numbers(self, failed_entries):
+        """Log failed numbers to a JSON file with timestamp"""
+        if not failed_entries:
+            return
+
+        failed_log_file = os.path.join(self.logs_dir, f"{self.timestamp}.json")
+
+        # Prepare data for JSON logging
+        log_data = {
+            "timestamp": self.timestamp,
+            "total_failed": len(failed_entries),
+            "failed_entries": failed_entries,
+        }
+
+        try:
+            with open(failed_log_file, "w", encoding="utf-8") as f:
+                json.dump(log_data, f, indent=2, ensure_ascii=False)
+            logger.info(f"📝 Failed numbers logged to: {failed_log_file}")
+        except Exception as e:
+            logger.error(f"❌ Failed to write log file: {e}")
 
     async def connect(self):
         """Connect to Telegram"""
@@ -165,7 +193,13 @@ class TelegramGroupManager:
                         raise ValueError("Entity is not a user")
                 except Exception as e:
                     logger.error(f"❌ Could not resolve {phone_number}: {e}")
-                    failed.append({"phone": phone_number, "error": str(e)})
+                    failed.append(
+                        {
+                            "phone": phone_number,
+                            "error": str(e),
+                            "error_type": "ResolutionError",
+                        }
+                    )
                     continue
 
                 if isinstance(group_entity, Channel):
@@ -199,17 +233,35 @@ class TelegramGroupManager:
             except UserAlreadyParticipantError:
                 logger.info(f"ℹ️ {phone_number} is already a member")
                 successful.append(phone_number)
-            except UserPrivacyRestrictedError:
-                failed.append({"phone": phone_number, "error": "Privacy restricted"})
+            except UserPrivacyRestrictedError as e:
+                failed.append(
+                    {
+                        "phone": phone_number,
+                        "error": str(e),
+                        "error_type": "PrivacyRestricted",
+                    }
+                )
             except FloodWaitError as e:
                 logger.warning(f"⏳ Flood wait {e.seconds}s, retrying...")
                 await asyncio.sleep(e.seconds)
                 phone_numbers.insert(i, phone_number)
             except (PeerFloodError, ChatAdminRequiredError) as e:
-                failed.append({"phone": phone_number, "error": str(e)})
+                failed.append(
+                    {
+                        "phone": phone_number,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                    }
+                )
                 break
             except Exception as e:
-                failed.append({"phone": phone_number, "error": str(e)})
+                failed.append(
+                    {
+                        "phone": phone_number,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                    }
+                )
 
         return successful, failed
 
@@ -298,9 +350,19 @@ async def batch_add_members():
             if i + CHUNK_SIZE < len(contacts):
                 await asyncio.sleep(CHUNK_DELAY)
 
+        # Log all failed numbers at the end
+        if all_failed:
+            manager.log_failed_numbers(all_failed)
+
         print("\n" + "═" * 60)
         print("🎉 BATCH PROCESS COMPLETED 🎉")
         print(f"✅ Added: {len(all_successful)} | ❌ Failed: {len(all_failed)}")
+
+        if all_failed:
+            print(
+                f"📝 Failed numbers logged to: logs/{manager.timestamp}.json"
+            )
+
         print("═" * 60 + "\n")
 
         # 🚀 Branding footer
